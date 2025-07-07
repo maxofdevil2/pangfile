@@ -1,6 +1,13 @@
 {
+  "name": "pangfile",
+  "version": "1.0.0",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express-rate-limit": "^7.5.1"
+    "express-rate-limit": "^7.5.1",
+    "express": "^4.18.2"
   }
 }
