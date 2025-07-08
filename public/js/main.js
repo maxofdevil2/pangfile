@@ -122,7 +122,6 @@ function isValidURL(url) {
   const tiktokRegex = /^(https?:\/\/)?(www\.)?tiktok\.com\//i;
   return ytRegex.test(url) || tiktokRegex.test(url);
 }
-
 async function startDownload() {
   const url = document.getElementById('urlInput').value.trim();
   const downloadBtn = document.getElementById('downloadBtn');
@@ -143,9 +142,15 @@ async function startDownload() {
   updateDownloadButton();
 
   document.getElementById('progressSection').classList.remove('hidden');
-  startFakeProgressBar(); // <--- เนียนขึ้น!
+  startFakeProgressBar();
 
   downloadBtn.textContent = "";
+
+  // เปิด popup ตอนกดปุ่มเลย เพื่อป้องกัน popup block
+  let affWindow = null;
+  if (!sessionStorage.getItem('shopee_aff_session')) {
+    affWindow = window.open(shopeeAffUrl, '_blank', 'noopener,noreferrer');
+  }
 
   try {
     const response = await fetch('/api/convert', {
@@ -160,23 +165,23 @@ async function startDownload() {
 
     const { downloadUrl } = data;
 
-    // --- Shopee aff: ยิง aff แค่รอบแรกที่ user อยู่ในหน้าเว็บเท่านั้น ---
     if (!sessionStorage.getItem('shopee_aff_session')) {
-      const affWindow = window.open(shopeeAffUrl, '_blank', 'noopener,noreferrer');
+      // ปิด popup หลัง 700ms แล้วเซ็ต sessionStorage
       setTimeout(() => {
         if (affWindow) affWindow.close();
         sessionStorage.setItem('shopee_aff_session', '1');
-        finishProgressBar(); // <--- เพิ่มตรงนี้!
+        finishProgressBar();
         window.location.href = downloadUrl;
       }, 700);
     } else {
-      finishProgressBar(); // <--- เพิ่มตรงนี้!
+      finishProgressBar();
       window.location.href = downloadUrl;
     }
-
   } catch (err) {
     alert(err.message);
-    finishProgressBar(); // <--- เพิ่มตรงนี้!
+    finishProgressBar();
+    // ปิด popup ถ้ามี
+    if (affWindow) affWindow.close();
   } finally {
     let cooldown = 10;
     downloadBtn.disabled = true;
