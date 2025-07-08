@@ -2,6 +2,43 @@ let selectedFormat = 'mp4';
 let isDownloading = false;
 let cooldownTimeout = null;
 
+// Shopee Affiliate URL ของคุณ
+const shopeeAffUrl = 'https://s.shopee.co.th/AUir90hVjN';
+let progressInterval = null;
+
+function startFakeProgressBar() {
+  const bar = document.querySelector('.progress-bar');
+  let percent = 0;
+  bar.style.width = '0%';
+  if (progressInterval) clearInterval(progressInterval);
+
+  progressInterval = setInterval(() => {
+    if (percent < 95) {
+      percent += Math.random() * 2 + 1;
+      if (percent > 95) percent = 95;
+      bar.style.width = percent + '%';
+    } else {
+      clearInterval(progressInterval);
+    }
+  }, 100);
+}
+
+function setProgressBarPercent(percent) {
+  const bar = document.querySelector('.progress-bar');
+  bar.style.width = percent + '%';
+  if (percent >= 100 && progressInterval) {
+    clearInterval(progressInterval);
+  }
+}
+
+function finishProgressBar() {
+  setProgressBarPercent(100);
+  setTimeout(() => {
+    document.getElementById('progressSection').classList.add('hidden');
+    setProgressBarPercent(0);
+  }, 1000);
+}
+
 // ฟังก์ชันวางลิงก์จากคลิปบอร์ด
 async function pasteFromClipboard() {
   try {
@@ -39,6 +76,7 @@ function updateDownloadButton() {
   const hasUrl = urlInput.value.trim() !== '';
   downloadBtn.disabled = !hasUrl || isDownloading;
 }
+
 function isValidVideoURL(url) {
   try {
     const parsed = new URL(url);
@@ -84,6 +122,7 @@ function isValidURL(url) {
   const tiktokRegex = /^(https?:\/\/)?(www\.)?tiktok\.com\//i;
   return ytRegex.test(url) || tiktokRegex.test(url);
 }
+
 async function startDownload() {
   const url = document.getElementById('urlInput').value.trim();
   const downloadBtn = document.getElementById('downloadBtn');
@@ -104,6 +143,8 @@ async function startDownload() {
   updateDownloadButton();
 
   document.getElementById('progressSection').classList.remove('hidden');
+  startFakeProgressBar(); // <--- เนียนขึ้น!
+
   downloadBtn.textContent = "";
 
   try {
@@ -118,16 +159,25 @@ async function startDownload() {
     if (!response.ok) throw new Error(data?.error || 'Conversion failed');
 
     const { downloadUrl } = data;
-    fetch('/go/shopee');
 
-    setTimeout(() => {
+    // --- Shopee aff: ยิง aff แค่รอบแรกที่ user อยู่ในหน้าเว็บเท่านั้น ---
+    if (!sessionStorage.getItem('shopee_aff_session')) {
+      const affWindow = window.open(shopeeAffUrl, '_blank', 'noopener,noreferrer');
+      setTimeout(() => {
+        if (affWindow) affWindow.close();
+        sessionStorage.setItem('shopee_aff_session', '1');
+        finishProgressBar(); // <--- เพิ่มตรงนี้!
+        window.location.href = downloadUrl;
+      }, 700);
+    } else {
+      finishProgressBar(); // <--- เพิ่มตรงนี้!
       window.location.href = downloadUrl;
-    }, 500);
+    }
 
   } catch (err) {
     alert(err.message);
+    finishProgressBar(); // <--- เพิ่มตรงนี้!
   } finally {
-    document.getElementById('progressSection').classList.add('hidden');
     let cooldown = 10;
     downloadBtn.disabled = true;
 

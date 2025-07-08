@@ -1,10 +1,9 @@
-// ✅ backend: server.js (หรือ index.js แล้วแต่คุณใช้ชื่อไฟล์)
-
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,7 +12,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
-// 🔐 ปลอดภัยสำหรับ URL
 function isValidUrl(userUrl) {
   try {
     const parsed = new URL(userUrl);
@@ -27,19 +25,111 @@ function isValidUrl(userUrl) {
     return false;
   }
 }
+
 const downloadDir = path.join(__dirname, '../public/downloads');
 if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir, { recursive: true });
-const rateLimit = require('express-rate-limit');
 
-// 🔒 จำกัด rate: 5 requests / นาที ต่อ IP
 const convertLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 นาที
-  max: 5, // ได้แค่ 5 ครั้งในช่วงเวลา
+  max: 5,
   message: {
     error: 'คุณใช้คำสั่งแปลงไฟล์บ่อยเกินไป กรุณารอสักครู่ก่อนทำรายการใหม่'
   }
 });
-app.post('/api/convert', convertLimiter, (req, res) => {
+
+const MAX_SIZE = 100 * 1024 * 1024; // 100MB
+
+async function checkFastEstimate(url, format) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--dump-json',
+      '-f', format === 'mp4'
+        ? 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]'
+        : 'bestaudio[ext=m4a]/bestaudio',
+      '--no-playlist',
+      url
+    ];
+    const info = spawn('yt-dlp', args);
+    let output = '';
+    info.stdout.on('data', data => { output += data.toString(); });
+    info.on('close', code => {
+      if (code !== 0) return resolve(null);
+      try {
+        const meta = JSON.parse(output);
+        const est =
+          meta.filesize_approx ||
+          meta.filesize ||
+          (meta.duration && meta.abr
+            ? meta.duration * meta.abr * 1000 / 8
+            : null);
+        resolve(est ? Number(est) : null);
+      } catch {
+        resolve(null);
+      }
+    });
+    info.on('error', reject);
+  });
+}
+
+// 🎯 Fallback + ตรวจจับ "ไม่มีเสียง" TikTok/YouTube
+function downloadMp3WithFallback(url, outputPath, callback) {
+  let ytdlpArgs = [
+    '-f', 'bestaudio[ext=m4a]/bestaudio',
+    '-o', '-', url
+  ];
+  let triedFallback = false;
+
+  function tryDownload(args) {
+    const dl = spawn('yt-dlp', args);
+    const ffArgs = [
+      '-i', 'pipe:0',
+      '-vn',
+      '-c:a', 'libmp3lame',
+      '-b:a', '256k',
+      outputPath
+    ];
+    const ff = spawn('ffmpeg', ffArgs);
+
+    dl.stdout.pipe(ff.stdin);
+
+    let dlErr = '';
+    let noAudioDetected = false;
+
+    dl.stderr.on('data', data => { dlErr += data.toString(); });
+
+    ff.stderr.on('data', data => {
+      const msg = data.toString();
+      console.error(`ffmpeg: ${msg}`);
+      // ตรวจจับ error ไม่มี stream เสียง (TikTok ไม่มี audio)
+      if (
+        msg.includes("Stream map") && msg.includes("matches no streams") ||
+        msg.includes("could not find codec") ||
+        msg.toLowerCase().includes("no audio")
+      ) {
+        noAudioDetected = true;
+      }
+    });
+
+    ff.on('close', code => {
+      if (code === 0 && !noAudioDetected) {
+        callback(null); // success
+      } else if (noAudioDetected) {
+        callback(new Error('คลิปนี้ไม่มีเสียงในไฟล์ (TikTok ไม่อนุญาตดึง audio stream หรือเป็นคลิปไม่มีเสียง)'));
+      } else if (!triedFallback &&
+        (dlErr.includes('requested format not available') ||
+         dlErr.includes('no suitable formats') ||
+         dlErr.toLowerCase().includes('error'))) {
+        triedFallback = true;
+        tryDownload(['-f', 'best[ext=mp4]', '-o', '-', url]);
+      } else {
+        callback(new Error('ไม่สามารถแปลงไฟล์ mp3 ได้'));
+      }
+    });
+  }
+  tryDownload(ytdlpArgs);
+}
+
+app.post('/api/convert', convertLimiter, async (req, res) => {
   const { url, format } = req.body;
 
   if (!url || !['mp3', 'mp4'].includes(format)) {
@@ -54,55 +144,65 @@ app.post('/api/convert', convertLimiter, (req, res) => {
     return res.status(400).json({ error: 'URL เป็นโพสต์ภาพ TikTok ซึ่งไม่รองรับ' });
   }
 
-  const randomName = `myweb_${Date.now()}${Math.floor(Math.random() * 1000000)}.${format}`;
+  // ประเมินขนาดไฟล์ก่อน
+  let fastSize = await checkFastEstimate(url, format);
+  if (fastSize && fastSize > MAX_SIZE * 0.95) {
+    return res.status(413).json({ error: 'ไฟล์นี้มีขนาดประมาณเกิน 100MB ไม่สามารถดาวน์โหลดได้' });
+  }
+
+  const randomName = `pangfile_${Date.now()}${Math.floor(Math.random() * 1000000)}.${format}`;
   const outputPath = path.join(downloadDir, randomName);
 
-  // ✅ โหลดแบบ mp4 เสมอ + จำกัดขนาดไฟล์ไม่เกิน 100MB
-  const ytdlpArgs = ['-f', 'mp4', '--max-filesize', '100M', '-o', '-', url];
-  const dl = spawn('yt-dlp', ytdlpArgs);
-
-  const ffArgs = format === 'mp4'
-    ? ['-i', 'pipe:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-movflags', 'frag_keyframe+empty_moov+faststart', outputPath]
-    : ['-i', 'pipe:0', '-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-ar', '44100', outputPath];
-
-  const ff = spawn('ffmpeg', ffArgs);
-
-  dl.stdout.pipe(ff.stdin);
-
-  // ✅ ตรวจจับ error ว่าไฟล์ใหญ่เกิน
-  dl.stderr.on('data', data => {
-    const msg = data.toString();
-    console.error(`yt-dlp: ${msg}`);
-
-    if (msg.includes('File is larger than max-filesize')) {
-      ff.kill('SIGKILL');
-      return res.status(413).json({ error: 'วิดีโอนี้มีขนาดเกิน 100MB ไม่สามารถดาวน์โหลดได้' });
-    }
-  });
-
-  ff.stderr.on('data', data => console.error(`ffmpeg: ${data}`));
-
- ff.on('close', code => {
-  if (code === 0) {
-    res.json({ downloadUrl: `/download/${randomName}` });
-
-    // ✅ ลบไฟล์หลัง 10 นาที
-    setTimeout(() => {
-      fs.unlink(outputPath, err => {
-        if (err) {
-          console.error(`ลบไฟล์ไม่สำเร็จ: ${outputPath}`, err);
-        } else {
-          console.log(`ลบไฟล์เรียบร้อย: ${outputPath}`);
-        }
-      });
-    }, 10 * 60 * 1000);
-
+  if (format === 'mp3') {
+    downloadMp3WithFallback(url, outputPath, (err) => {
+      if (!err) {
+        res.json({ downloadUrl: `/download/${randomName}` });
+        setTimeout(() => fs.unlink(outputPath, () => {}), 10 * 60 * 1000);
+      } else {
+        // แจ้งข้อความเฉพาะกรณีไม่มีเสียง
+        res.status(500).json({
+          error: err.message || 'ไม่สามารถแปลงไฟล์ mp3 ได้'
+        });
+      }
+    });
   } else {
-    console.error(`ffmpeg exited with code ${code}`);
-    res.status(500).json({ error: 'ไม่สามารถแปลงไฟล์ได้ โปรดลองใหม่อีกครั้ง' });
+    let ytdlpArgs;
+    if (url.includes('tiktok.com')) {
+      ytdlpArgs = [
+        '-f', 'best[ext=mp4][height<=720]/best[ext=mp4]',
+        '--merge-output-format', 'mp4',
+        '-o', outputPath,
+        url
+      ];
+    } else if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      ytdlpArgs = [
+        '-f', 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
+        '--merge-output-format', 'mp4',
+        '-o', outputPath,
+        url
+      ];
+    } else {
+      return res.status(400).json({ error: 'รองรับเฉพาะ YouTube, TikTok เท่านั้น' });
+    }
+
+    const dl = spawn('yt-dlp', ytdlpArgs);
+
+    dl.on('close', code => {
+      if (code === 0) {
+        res.json({ downloadUrl: `/download/${randomName}` });
+        setTimeout(() => fs.unlink(outputPath, () => {}), 10 * 60 * 1000);
+      } else {
+        res.status(500).json({ error: 'ไม่สามารถดาวน์โหลด mp4 ได้' });
+      }
+    });
+
+    dl.stderr.on('data', data => {
+      const msg = data.toString();
+      console.error(`yt-dlp: ${msg}`);
+    });
   }
 });
-});
+
 app.get('/download/:filename', (req, res) => {
   const filename = req.params.filename;
 
@@ -114,7 +214,6 @@ app.get('/download/:filename', (req, res) => {
   const filePath = path.join(downloadDir, filename);
   const normalizedPath = path.normalize(filePath);
 
-  // ตรวจสอบว่าไฟล์ยังอยู่ในโฟลเดอร์ downloadDir จริง
   if (!normalizedPath.startsWith(downloadDir)) {
     return res.status(403).send('ไม่อนุญาตให้เข้าถึงไฟล์');
   }
@@ -126,6 +225,4 @@ app.get('/download/:filename', (req, res) => {
   }
 });
 
-
-
-app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Server running at http://0.0.0.0:${PORT}`));
